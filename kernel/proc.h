@@ -1,3 +1,16 @@
+#define SIG_DFL 0 /* default signal handling */
+#define SIG_IGN 1 /* ignore signal */
+#define SIGKILL 9
+#define SIGSTOP 17
+#define SIGCONT 19
+
+void signal_handler_exec(void);
+
+struct sigaction {
+  void (*sa_handler)(int);
+  uint sigmask;
+};
+
 // Saved registers for kernel context switches.
 struct context {
   uint64 ra;
@@ -105,4 +118,11 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+  uint pending_signals;                                    // pending signals
+  uint signal_mask;  
+  uint signal_mask_backup;
+  void (*sig_handlers[32])(int);  
+  struct trapframe* user_tf_backup; 
+  uint is_stopped; 
+  uint mask_per_signal_arr[32];
 };

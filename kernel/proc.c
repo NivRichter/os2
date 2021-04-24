@@ -16,6 +16,8 @@ int nextpid = 1;
 struct spinlock pid_lock;
 
 extern void forkret(void);
+extern void sigret_start(void);
+extern void sigret_end(void);
 static void freeproc(struct proc *p);
 
 extern char trampoline[]; // trampoline.S
@@ -244,6 +246,15 @@ userinit(void)
 
   p->state = RUNNABLE;
 
+  // init the added fields 
+  p->is_stopped = 0;
+  p->signal_mask = 0;
+  p->pending_signals = 0;
+  for(int sig_num = 0; sig_num < 32; sig_num++){
+    p->sig_handlers[sig_num] = SIG_DFL;
+    p->mask_per_signal_arr[sig_num] = 0;
+  }
+
   release(&p->lock);
 }
 
@@ -312,6 +323,13 @@ fork(void)
   release(&wait_lock);
 
   acquire(&np->lock);
+  np->is_stopped = 0;
+  np->pending_signals = 0;
+  np->signal_mask = p->signal_mask;
+  for(int sig_num=0; sig_num< 32; sig_num++){
+    np->sig_handlers[sig_num] = p->sig_handlers[sig_num];
+    np->mask_per_signal_arr[sig_num] = p->mask_per_signal_arr[sig_num];
+  }
   np->state = RUNNABLE;
   release(&np->lock);
 
@@ -576,17 +594,24 @@ wakeup(void *chan)
 // The victim won't exit until it tries to return
 // to user space (see usertrap() in trap.c).
 int
-kill(int pid)
+kill(int pid, int signum)
 {
+  // check if the signum is legal
+  if(signum < 0 || signum > 31)
+    return -1;
   struct proc *p;
-
   for(p = proc; p < &proc[NPROC]; p++){
     acquire(&p->lock);
     if(p->pid == pid){
-      p->killed = 1;
-      if(p->state == SLEEPING){
-        // Wake process from sleep().
-        p->state = RUNNABLE;
+      if(signum == SIGKILL){
+        p->killed = 1;
+        if(p->state == SLEEPING){
+          // Wake process from sleep().
+          p->state = RUNNABLE;
+        }
+      }
+      else{ // if the signal isn't kill, then add it to the pending signals
+        p->pending_signals = (p->pending_signals | (1 << signum));
       }
       release(&p->lock);
       return 0;
@@ -594,6 +619,53 @@ kill(int pid)
     release(&p->lock);
   }
   return -1;
+}
+
+int
+sigprocmask(int sig_mask){
+  struct proc *p = myproc();
+  int old_mask = p->signal_mask;
+  p->signal_mask = sig_mask;
+  return old_mask;
+}
+
+int
+sigaction(int signum, const struct sigaction *act, struct sigaction *oldact){
+
+  // check if the signum is legal
+  if(signum < 0 || signum > 31)
+    return -1;
+  struct proc *p = myproc();
+  if(signum == SIGSTOP || signum == SIGKILL)
+    return -1;
+
+
+  // if(oldact != 0){
+  //   oldact->sa_handler = p->sig_handlers[signum];
+  //   oldact->sigmask = p->mask_per_signal_arr[signum];
+  // }
+  if(act != 0){
+    // p->sig_handlers[signum] = act->sa_handler;
+
+    // p->signal_mask = act->sigmask;
+
+    copyin(p->pagetable,(char *)p->sig_handlers[signum], (uint64)act->sa_handler, sizeof(act->sa_handler));
+    printf( "HERE!\n");
+
+    copyin(p->pagetable, (char *)&(p->mask_per_signal_arr[signum]), act->sigmask, 32);
+
+    return 0;
+  }
+  return -1;
+}
+
+void
+sigret(void){
+  struct proc *p = myproc();
+  // move data from backup trapframe to current trapframe
+  memmove((void*)(p->trapframe), (void*)(p->user_tf_backup), sizeof(struct trapframe));
+  p->signal_mask = p->signal_mask_backup;
+  return;
 }
 
 // Copy to either a user address, or kernel address,
@@ -652,5 +724,148 @@ procdump(void)
       state = "???";
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
+  }
+}
+
+
+void sig_kill(void){
+  struct proc *p = myproc();
+  acquire(&p->lock);
+  p->killed = 1;
+  if(p->state == SLEEPING){
+  // Wake process from sleep().
+    p->state = RUNNABLE;
+  }
+  release(&p->lock);
+}
+
+void sig_stop(void){
+  struct proc *p = myproc();
+  acquire(&p->lock);
+  p->is_stopped = 1;
+  release(&p->lock);
+}
+
+void sig_cont(void){
+  struct proc *p = myproc();
+  acquire(&p->lock);
+  p->is_stopped = 0;
+  release(&p->lock);
+}
+
+void signal_handler_exec(void){
+
+  struct proc *p = myproc();
+
+  // check if the process is freezed
+  while(p->is_stopped == 1) { 
+    // check if we got a CONT signal
+    int needs_yield = 1; // if enters all "if's", set it to 0;
+    if((p->pending_signals & (1<<SIGCONT)) != 0){
+      if((p-> signal_mask & (1<<SIGCONT)) == 0){
+        if(p->sig_handlers[SIGCONT] == SIG_DFL){
+          needs_yield = 0;
+          p->pending_signals = p->pending_signals ^ (1<<SIGCONT);
+          sig_cont();
+        }
+      }
+    } 
+    if(needs_yield == 1) // if enters, then CONT wasnt sent yet.
+      yield();
+  }
+
+
+  // Got here, so process isn't stopped.
+  if(p->pending_signals != 0){
+    // Loop on all the signals to check which is on starting from 0
+    for(int i=0; i<32; i++){
+      if((p->pending_signals & (1<<i)) != 0){ // if i'th bit is on
+        // check if signal is STOP or KILL because cant be blocked
+        if(i == SIGSTOP){
+            // backup signal mask and set the new mask to be specific for that signal handler
+            p->signal_mask_backup = p->signal_mask;
+            p->signal_mask = p->mask_per_signal_arr[i];
+            p->pending_signals = p->pending_signals ^ (1<<i); // set bit to 0
+            sig_stop();
+            // restore backup signal mask
+            p->signal_mask = p->signal_mask_backup;
+        }else if(i == SIGKILL){
+            // backup signal mask and set the new mask to be specific for that signal handler
+            p->signal_mask_backup = p->signal_mask;
+            p->signal_mask = p->mask_per_signal_arr[i];
+            p->pending_signals = p->pending_signals ^ (1<<i); // set bit to 0
+            sig_kill();
+            // restore backup signal mask
+            p->signal_mask = p->signal_mask_backup;
+        }else if((p-> signal_mask & (1<<i)) == 0){ // check if signal isnt blocked
+          // check if signal is CONT
+          if(i == SIGCONT){
+            // backup signal mask and set the new mask to be specific for that signal handler
+            p->signal_mask_backup = p->signal_mask;
+            p->signal_mask = p->mask_per_signal_arr[i];
+            p->pending_signals = p->pending_signals ^ (1<<i); // set bit to 0
+            sig_cont();
+            // restore backup signal mask
+            p->signal_mask = p->signal_mask_backup;
+          }
+          // if its default then do kill for all
+          else if((uint64)p->sig_handlers[i] == SIG_DFL){
+            // backup signal mask and set the new mask to be specific for that signal handler
+            p->signal_mask_backup = p->signal_mask;
+            p->signal_mask = p->mask_per_signal_arr[i];
+            p->pending_signals = p->pending_signals ^ (1<<i); // set bit to 0
+            sig_kill();
+            // restore backup signal mask
+            p->signal_mask = p->signal_mask_backup;
+          }
+          else if((uint64)p->sig_handlers[i] == SIG_IGN){
+            p->pending_signals = p->pending_signals ^ (1<<i); // set bit to 0
+          }
+          else{ // Got here so it's user handler
+            p->pending_signals = p->pending_signals ^ (1<<i); // set bit to 0
+
+            // save space in stack for backup and backup the trapframe
+            uint64 addr_trapframe = p->trapframe->sp - sizeof(struct trapframe);
+            p->user_tf_backup->sp = (uint64)(struct trapframe *)addr_trapframe;
+            copyout(p->pagetable, p->user_tf_backup->sp,(char *)p->trapframe, sizeof(struct trapframe));
+            //memmove((void *)(addr_trapframe), p->trapframe, sizeof(struct trapframe) );
+            copyout(p->pagetable, p->trapframe->epc, (char *)p->sig_handlers[i], sizeof(uint64));
+            uint64 inject_size = (uint64)(sigret_end) - (uint64)(sigret_start);
+            p->trapframe->sp -= inject_size; // make room for the injected code
+            copyout(p->pagetable, p->trapframe->sp, (char *)sigret_start, inject_size);
+            // store arguments
+            p->trapframe->a0 = i;
+            // return address
+            p->trapframe->ra = addr_trapframe;
+            
+            // p->trapframe->sp -=sizeof(struct trapframe);
+  
+            // p->signal_mask_backup = p->signal_mask; // backup signal mask
+            // p->signal_mask = p->mask_per_signal_arr[i]; // change the signal mask to the one of the handler
+
+            // // inject the sigret system call to the stack
+            // uint64 inject_size = (uint64)(sigret_end) - (uint64)(sigret_start);
+            // p->trapframe->sp -= inject_size; // make room for the injected code
+            // uint64 sigret_start_pointer = p->trapframe->sp;
+            // memmove((void*)(p->trapframe->sp), sigret_start, inject_size);
+
+            // // store arguments
+            // p->trapframe->a0 = i;
+            // // push return adress 
+            // p->trapframe->sp -= 4;  
+            // *((int*)(p->trapframe->sp)) = sigret_start_pointer;
+            // // set IP to point to handler and jump to func  
+            // copyout(p->pagetable, p->trapframe->epc, (uint64)p->sig_handlers[i], sizeof(uint64));
+            // //p->trapframe->epc = (uint64)p->sig_handlers[i];
+            // //break;
+          }
+        }
+      }
+    }
+  }
+  else{ // if no pending signals, return
+    return;
+    //yield();
+
   }
 }

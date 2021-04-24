@@ -74,7 +74,9 @@ usertrap(void)
   }
 
   if(p->killed)
+    {
     exit(-1);
+    }
 
   // give up the CPU if this is a timer interrupt.
   if(which_dev == 2)
@@ -117,6 +119,9 @@ usertrapret(void)
 
   // set S Exception Program Counter to the saved user pc.
   w_sepc(p->trapframe->epc);
+
+  // pending signals must be checked by the kernel
+  signal_handler_exec();
 
   // tell trampoline.S the user page table to switch to.
   uint64 satp = MAKE_SATP(p->pagetable);

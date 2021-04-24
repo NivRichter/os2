@@ -8,6 +8,9 @@
 	# kernel.ld causes this to be aligned
         # to a page boundary.
         #
+
+#include "syscall.h"
+
 	.section trampsec
 .globl trampoline
 trampoline:
@@ -139,3 +142,12 @@ userret:
         # return to user mode and user pc.
         # usertrapret() set up sstatus and sepc.
         sret
+
+
+# our code that will execute the sigret systemcall
+  .globl sigret_start
+  .globl sigret_end
+  sigret_start:
+    li a7, SYS_sigret
+    ecall
+  sigret_end:
